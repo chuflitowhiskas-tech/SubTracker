@@ -1,0 +1,12 @@
+# Carpeta local de Hoplite (entorno de trabajo de este repo)
+.hoplite/
+
+# Artefactos de Xcode
+DerivedData/
+xcuserdata/
+
+# Base de datos SQLite local generada por el backend
+subtracker.db
+
+# Binario compilado del backend
+subtrackerbackend
