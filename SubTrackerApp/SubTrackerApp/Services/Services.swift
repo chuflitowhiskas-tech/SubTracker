@@ -6,12 +6,27 @@ class SystemIntegrations {
     static let shared = SystemIntegrations()
     let eventStore = EKEventStore()
 
-    func requestPermissions() {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    func requestPermissions(completion: (() -> Void)? = nil) {
+        let group = DispatchGroup()
+
+        group.enter()
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in group.leave() }
+
+        group.enter()
         if #available(iOS 17.0, macOS 14.0, *) {
-            eventStore.requestFullAccessToEvents { _, _ in }
+            eventStore.requestFullAccessToEvents { _, _ in group.leave() }
         } else {
-            eventStore.requestAccess(to: .event) { _, _ in }
+            eventStore.requestAccess(to: .event) { _, _ in group.leave() }
+        }
+
+        group.notify(queue: .main) {
+            completion?()
+        }
+    }
+
+    func scheduleNotificationAndEventAfterPermissionGranted(for subscription: Subscription) {
+        requestPermissions {
+            self.scheduleNotificationAndEvent(for: subscription)
         }
     }
 
@@ -29,8 +44,10 @@ class SystemIntegrations {
         let components = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: notificationDate)
         let trigger = UNCalendarNotificationTrigger(dateMatching: components, repeats: false)
 
+        let center = UNUserNotificationCenter.current()
+        center.removePendingNotificationRequests(withIdentifiers: [subscription.id])
         let request = UNNotificationRequest(identifier: subscription.id, content: content, trigger: trigger)
-        UNUserNotificationCenter.current().add(request)
+        center.add(request)
 
         // Add to Calendar
         if EKEventStore.authorizationStatus(for: .event) == .authorized || EKEventStore.authorizationStatus(for: .event) == .fullAccess {

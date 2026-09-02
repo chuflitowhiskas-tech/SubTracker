@@ -7,6 +7,9 @@ struct DashboardView: View {
     @Query private var ratesCache: [ExchangeRatesCache]
 
     @State private var showingAddSubscription = false
+    @State private var pendingDeletionOffsets: IndexSet?
+    @State private var syncErrorMessage = ""
+    @State private var showSyncError = false
 
     var body: some View {
         NavigationStack {
@@ -14,12 +17,46 @@ struct DashboardView: View {
                 summarySection
 
                 List {
-                    ForEach(subscriptions) { sub in
-                        NavigationLink(destination: EditSubscriptionView(subscription: sub)) {
-                            SubscriptionRow(subscription: sub, rates: currentRates)
+                    if subscriptions.isEmpty {
+                        emptyState
+                    } else {
+                        ForEach(subscriptions) { sub in
+                            NavigationLink(destination: EditSubscriptionView(subscription: sub)) {
+                                SubscriptionRow(subscription: sub, rates: currentRates)
+                            }
+                        }
+                        .onDelete(perform: deleteSubscriptions)
+                    }
+                }
+                .refreshable {
+                    await syncData()
+                }
+                .confirmationDialog(
+                    "Delete Subscription?",
+                    isPresented: Binding(
+                        get: { pendingDeletionOffsets != nil },
+                        set: { if !$0 { pendingDeletionOffsets = nil } }
+                    ),
+                    titleVisibility: .visible
+                ) {
+                    Button("Delete", role: .destructive) {
+                        if let offsets = pendingDeletionOffsets {
+                            performDelete(offsets)
                         }
                     }
-                    .onDelete(perform: deleteSubscriptions)
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    if let offsets = pendingDeletionOffsets, let index = offsets.first {
+                        Text(offsets.count == 1
+                            ? "This removes \(subscriptions[index].name) and its payment reminder."
+                            : "This removes \(offsets.count) subscriptions and their payment reminders.")
+                    }
+                }
+                .alert("Couldn't Sync", isPresented: $showSyncError) {
+                    Button("Retry") { Task { await syncData() } }
+                    Button("OK", role: .cancel) {}
+                } message: {
+                    Text(syncErrorMessage)
                 }
             }
             .navigationTitle("SubTracker")
@@ -36,10 +73,24 @@ struct DashboardView: View {
             .task {
                 await syncData()
             }
-            .onAppear {
-                SystemIntegrations.shared.requestPermissions()
-            }
         }
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "tray")
+                .font(.largeTitle)
+                .foregroundColor(.secondary)
+            Text("No Subscriptions Yet")
+                .font(.headline)
+            Text("Tap + to add your first subscription and start tracking.")
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 40)
+        .listRowSeparator(.hidden)
     }
 
     private var currentRates: ExchangeRatesCache {
@@ -75,6 +126,10 @@ struct DashboardView: View {
     }
 
     private func deleteSubscriptions(offsets: IndexSet) {
+        pendingDeletionOffsets = offsets
+    }
+
+    private func performDelete(_ offsets: IndexSet) {
         for index in offsets {
             let sub = subscriptions[index]
             modelContext.delete(sub)
@@ -87,6 +142,8 @@ struct DashboardView: View {
     }
 
     private func syncData() async {
+        var failureMessage: String?
+
         do {
             let rates = try await ApiClient.shared.fetchRates()
             if let cache = ratesCache.first {
@@ -96,23 +153,29 @@ struct DashboardView: View {
             } else {
                 modelContext.insert(ExchangeRatesCache(usdPen: rates.usd_pen, arsPen: rates.ars_pen, updatedAt: Date()))
             }
+        } catch {
+            failureMessage = "Couldn't refresh exchange rates."
+        }
 
+        do {
             let apiSubs = try await ApiClient.shared.fetchSubscriptions()
             // In a real app, you'd do a proper diff here. For simplicity, we just clear and add.
             // Be careful to not delete local unsynced changes.
             // Simplified offline-first logic for demonstration:
             let localIds = Set(subscriptions.map { $0.id })
 
-            for apiSub in apiSubs {
-                if !localIds.contains(apiSub.id) {
-                    let newSub = Subscription(id: apiSub.id, name: apiSub.name, cost: apiSub.cost, currency: apiSub.currency, billingDay: apiSub.billingDay)
-                    modelContext.insert(newSub)
-                    SystemIntegrations.shared.scheduleNotificationAndEvent(for: newSub)
-                }
+            for apiSub in apiSubs where !localIds.contains(apiSub.id) {
+                let newSub = Subscription(id: apiSub.id, name: apiSub.name, cost: apiSub.cost, currency: apiSub.currency, billingDay: apiSub.billingDay)
+                modelContext.insert(newSub)
+                SystemIntegrations.shared.scheduleNotificationAndEventAfterPermissionGranted(for: newSub)
             }
-
         } catch {
-            print("Sync failed: \(error)")
+            failureMessage = "Couldn't refresh subscriptions."
+        }
+
+        if let failureMessage {
+            syncErrorMessage = failureMessage
+            showSyncError = true
         }
     }
 }
@@ -157,14 +220,20 @@ struct AddSubscriptionView: View {
     @State private var cost: Double = 0.0
     @State private var currency = "PEN"
     @State private var billingDay = 1
+    @FocusState private var costFieldFocused: Bool
 
     let currencies = ["PEN", "USD", "ARS"]
+
+    private var trimmedName: String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 
     var body: some View {
         NavigationStack {
             Form {
                 TextField("Name", text: $name)
                 TextField("Cost", value: $cost, format: .number)
+                    .focused($costFieldFocused)
 #if os(iOS)
                     .keyboardType(.decimalPad)
 #endif
@@ -190,16 +259,22 @@ struct AddSubscriptionView: View {
                     Button("Save") {
                         save()
                     }
-                    .disabled(name.isEmpty || cost <= 0)
+                    .disabled(trimmedName.isEmpty || cost <= 0)
+                }
+                if costFieldFocused {
+                    ToolbarItemGroup(placement: .keyboard) {
+                        Spacer()
+                        Button("Done") { costFieldFocused = false }
+                    }
                 }
             }
         }
     }
 
     private func save() {
-        let sub = Subscription(name: name, cost: cost, currency: currency, billingDay: billingDay)
+        let sub = Subscription(name: trimmedName, cost: cost, currency: currency, billingDay: billingDay)
         modelContext.insert(sub)
-        SystemIntegrations.shared.scheduleNotificationAndEvent(for: sub)
+        SystemIntegrations.shared.scheduleNotificationAndEventAfterPermissionGranted(for: sub)
 
         Task {
             try? await ApiClient.shared.createSubscription(sub)
@@ -217,6 +292,7 @@ struct EditSubscriptionView: View {
     @State private var cost: Double
     @State private var currency: String
     @State private var billingDay: Int
+    @FocusState private var costFieldFocused: Bool
 
     let subscription: Subscription
     let currencies = ["PEN", "USD", "ARS"]
@@ -229,10 +305,15 @@ struct EditSubscriptionView: View {
         _billingDay = State(initialValue: subscription.billingDay)
     }
 
+    private var trimmedName: String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     var body: some View {
         Form {
             TextField("Name", text: $name)
             TextField("Cost", value: $cost, format: .number)
+                .focused($costFieldFocused)
 #if os(iOS)
                 .keyboardType(.decimalPad)
 #endif
@@ -255,20 +336,24 @@ struct EditSubscriptionView: View {
                 Button("Save") {
                     save()
                 }
-                .disabled(name.isEmpty || cost <= 0)
+                .disabled(trimmedName.isEmpty || cost <= 0)
+            }
+            if costFieldFocused {
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Done") { costFieldFocused = false }
+                }
             }
         }
     }
 
     private func save() {
-        SystemIntegrations.shared.cancelNotification(for: subscription.id)
-
-        subscription.name = name
+        subscription.name = trimmedName
         subscription.cost = cost
         subscription.currency = currency
         subscription.billingDay = billingDay
 
-        SystemIntegrations.shared.scheduleNotificationAndEvent(for: subscription)
+        SystemIntegrations.shared.scheduleNotificationAndEventAfterPermissionGranted(for: subscription)
 
         Task {
             try? await ApiClient.shared.updateSubscription(subscription)
