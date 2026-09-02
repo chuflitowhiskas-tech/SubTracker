@@ -36,6 +36,12 @@ func StartWorker() {
 }
 
 func updateRates() {
+	updateRatesWith(fetchUSDPEN, fetchUSDARS)
+}
+
+// updateRatesWith keeps the fetch functions injectable so tests can exercise
+// the full update path without hitting the live rate APIs.
+func updateRatesWith(fetchUSDPEN, fetchUSDARS func() (float64, error)) {
 	usdPen, err := fetchUSDPEN()
 	if err != nil {
 		log.Println("Error fetching USD to PEN rate:", err)
