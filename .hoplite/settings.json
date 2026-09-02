@@ -7,7 +7,7 @@
 	"scripts": {
 		"setup": {
 			"enabled": true,
-			"command": "mise install -y go@1.24.3 && ln -sf ~/.local/share/mise/installs/go/1.24.3/bin/* /usr/local/bin/"
+			"command": "mise install -y go@1.24.3 && ln -sf ~/.local/share/mise/installs/go/1.24.3/bin/* /usr/local/bin/ && apt-get update -qq && apt-get install -y -qq git-lfs"
 		},
 		"run": {
 			"enabled": true,
